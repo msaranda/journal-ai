@@ -1,0 +1,647 @@
+---
+import Timer from './Timer.astro';
+import Dictation from '../islands/Dictation';
+import PhaseTimer from '../islands/PhaseTimer';
+
+const { session, settings } = Astro.props;
+
+const phases = [
+  { name: 'Opening', duration: 120, prompt: "Here's what's weighing on me today..." },
+  { 
+    name: 'Problem 1', 
+    duration: 180, 
+    prompt: 'What happened?',
+    subPrompts: ['How do I feel?', "What's in my control?", 'One small action?']
+  },
+  { 
+    name: 'Problem 2', 
+    duration: 180, 
+    prompt: 'What happened?',
+    subPrompts: ['How do I feel?', "What's in my control?", 'One small action?']
+  },
+  { 
+    name: 'Problem 3', 
+    duration: 180, 
+    prompt: 'What happened?',
+    subPrompts: ['How do I feel?', "What's in my control?", 'One small action?']
+  },
+  { name: 'Pattern Check', duration: 120, prompt: 'Recurring theme from previous days?' },
+  { 
+    name: 'Closing', 
+    duration: 120, 
+    prompt: 'Tomorrow I will...',
+    subPrompts: ["I'm letting go of..."]
+  }
+];
+---
+
+<div class="bg-white dark:bg-neutral-950 rounded-xl border border-neutral-200 dark:border-neutral-800">
+  <!-- Phase Timer -->
+  <div class="border-b border-neutral-200 dark:border-neutral-800 p-4">
+    <PhaseTimer phases={phases} client:load />
+  </div>
+  
+  <!-- Journal Content Area -->
+  <div class="p-6">
+    <!-- Guided Prompts -->
+    <div id="phase-prompts" class="mb-4 text-sm text-neutral-600 dark:text-neutral-400">
+      <p class="italic">Start with: "Here's what's weighing on me today..."</p>
+      <div class="mt-2 text-xs space-y-1">
+        <p>💡 Be specific, not abstract</p>
+        <p>💡 Use "I" statements</p>
+        <p>💡 No self-censoring - it's okay to vent</p>
+      </div>
+    </div>
+    
+    <!-- Previous Session Content (Read-only) -->
+    <div id="previous-content-section" class="mb-2 hidden">
+      <div class="mb-1">
+        <h4 class="text-sm font-medium text-neutral-700 dark:text-neutral-300">Previous Session Content</h4>
+        <p class="text-xs text-neutral-500">This content is from your earlier session today and cannot be edited.</p>
+      </div>
+      <div 
+        id="previous-content"
+        class="w-full p-2 bg-neutral-100 dark:bg-neutral-800 rounded-lg 
+               border border-neutral-300 dark:border-neutral-700
+               text-neutral-600 dark:text-neutral-400 text-sm
+               max-h-[200px] overflow-y-auto whitespace-pre-wrap"
+      ></div>
+    </div>
+
+    <!-- New Content Area (Editable) -->
+    <div class="mb-3">
+      <div class="mb-1" id="new-content-label">
+        <h4 class="text-sm font-medium text-neutral-700 dark:text-neutral-300">
+          <span id="content-area-title">Today's Journal Entry</span>
+        </h4>
+        <p class="text-xs text-neutral-500" id="content-area-subtitle">Begin writing or use the microphone to dictate...</p>
+      </div>
+      <textarea
+        id="journal-content"
+        class="w-full min-h-[500px] p-3 bg-neutral-50 dark:bg-neutral-900 rounded-lg 
+               border border-neutral-200 dark:border-neutral-800 
+               focus:outline-none focus:ring-2 focus:ring-blue-500 dark:focus:ring-blue-400
+               text-neutral-900 dark:text-neutral-100 resize-none leading-relaxed"
+        placeholder="Begin writing or use the microphone to dictate..."
+      ></textarea>
+    </div>
+    
+    <!-- Dictation Controls and Save Button -->
+    <div class="flex items-start justify-between gap-4">
+      <div class="flex-1">
+    <Dictation 
+      sttEngine={settings.stt_engine}
+      sttLanguage={settings.stt_language}
+      client:load 
+    />
+      </div>
+      
+      <button 
+        id="save-now"
+        class="px-4 py-2 bg-blue-500 hover:bg-blue-600 text-white rounded-lg transition whitespace-nowrap"
+      >
+        Save to File
+      </button>
+    </div>
+    
+    <!-- Session Warning (for existing sessions) -->
+    <div id="session-warning" class="hidden mb-2 p-2 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-lg">
+      <div class="flex items-start space-x-2">
+        <div class="text-amber-600 dark:text-amber-400 mt-0.5">⚠️</div>
+        <div class="text-sm">
+          <p class="font-medium text-amber-800 dark:text-amber-200">Existing Session Detected</p>
+          <p class="text-amber-700 dark:text-amber-300 mt-1" id="warning-message"></p>
+          <div class="mt-2 space-x-2">
+            <button id="append-btn" class="px-3 py-1 bg-amber-600 hover:bg-amber-700 text-white rounded text-xs transition">
+              Append to existing
+            </button>
+            <button id="overwrite-btn" class="px-3 py-1 bg-neutral-600 hover:bg-neutral-700 text-white rounded text-xs transition">
+              Overwrite
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Session Timer Display -->
+    <div class="mb-2 text-sm text-neutral-600 dark:text-neutral-400">
+      <span id="session-timer">Session time: 0:00</span>
+    </div>
+    
+    <!-- Save Status -->
+    <div class="mt-2">
+      <div class="text-sm text-neutral-500">
+        <span id="save-status">Auto-drafting enabled</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  // Session timing and draft functionality
+  let saveTimeout: NodeJS.Timeout;
+  let sessionTimerInterval: NodeJS.Timeout;
+  let isAppendMode = false;
+  let hasShownWarning = false;
+  let existingSessionData: any = null;
+  let originalContent = '';
+  let hasLoadedExistingSession = false;
+  let draftKey = `journal-draft-${new Date().toISOString().split('T')[0]}`;
+  
+  const content = document.getElementById('journal-content') as HTMLTextAreaElement;
+  const saveStatus = document.getElementById('save-status');
+  const saveButton = document.getElementById('save-now');
+  const sessionTimer = document.getElementById('session-timer');
+  const sessionWarning = document.getElementById('session-warning');
+  const warningMessage = document.getElementById('warning-message');
+  const appendBtn = document.getElementById('append-btn');
+  const overwriteBtn = document.getElementById('overwrite-btn');
+  const previousContentSection = document.getElementById('previous-content-section');
+  const previousContent = document.getElementById('previous-content');
+  const contentAreaTitle = document.getElementById('content-area-title');
+  const contentAreaSubtitle = document.getElementById('content-area-subtitle');
+  
+  // Initialize content areas after DOM is ready
+  document.addEventListener('DOMContentLoaded', () => {
+    initializeContentAreas();
+  });
+  
+  // Also initialize immediately in case DOMContentLoaded already fired
+  if (document.readyState === 'loading') {
+    // DOM is still loading, wait for DOMContentLoaded
+  } else {
+    // DOM is already loaded
+    initializeContentAreas();
+  }
+  
+  async function initializeContentAreas() {
+    // Check if we have session data from server-side rendering
+    const serverSession = (window as any).sessionData || null;
+    
+    console.log('Initializing content areas...');
+    console.log('Server session data:', serverSession);
+    console.log('Document ready state:', document.readyState);
+    console.log('Content element:', content);
+    console.log('Previous content elements:', { previousContent, previousContentSection });
+    
+    // Check for unsaved draft first
+    const draft = loadDraft();
+    if (draft && draft.content.trim()) {
+      console.log('Found unsaved draft');
+      showDraftRecovery(draft);
+      return;
+    }
+    
+    if (serverSession && serverSession.content && serverSession.content.trim()) {
+      // We have server-side session data
+      console.log('Found server-side session content:', serverSession.content.substring(0, 100) + '...');
+      showExistingContent(serverSession.content);
+    } else {
+      // No server-side content, try to load today's session
+      console.log('No server-side content, loading today\'s session...');
+      await loadTodaysSession();
+    }
+  }
+  
+  async function loadTodaysSession() {
+    try {
+      const today = new Date().toISOString().split('T')[0];
+      console.log('Loading session for date:', today);
+      
+      const response = await fetch('/api/vault', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'load',
+          date: today
+        })
+      });
+      
+      console.log('Load session response status:', response.status);
+      
+      if (response.ok) {
+        const sessionData = await response.json();
+        console.log('Loaded session data:', sessionData);
+        
+        if (sessionData && sessionData.content) {
+          console.log('Found session content, showing existing content');
+          showExistingContent(sessionData.content);
+        } else {
+          console.log('No content in session data');
+        }
+      } else {
+        console.log('Failed to load session, response not ok');
+      }
+    } catch (error) {
+      console.log('Error loading session:', error);
+    }
+  }
+  
+  function showExistingContent(existingContent: string) {
+    console.log('showExistingContent called with:', existingContent.substring(0, 100) + '...');
+    
+    originalContent = existingContent;
+    hasLoadedExistingSession = true;
+    
+    console.log('previousContent element:', previousContent);
+    console.log('previousContentSection element:', previousContentSection);
+    
+    if (previousContent && previousContentSection) {
+      previousContent.textContent = existingContent;
+      previousContentSection.classList.remove('hidden');
+      console.log('Previous content section should now be visible');
+    } else {
+      console.log('Could not find previous content elements');
+    }
+    
+    // Clear the editable textarea and update labels
+    if (content) {
+      content.value = '';
+      content.placeholder = 'Continue your journal entry here...';
+      console.log('Cleared editable textarea');
+    }
+    
+    if (contentAreaTitle) {
+      contentAreaTitle.textContent = 'Continue Your Entry';
+    }
+    if (contentAreaSubtitle) {
+      contentAreaSubtitle.textContent = 'Add new thoughts to your existing session...';
+    }
+    
+    console.log('showExistingContent completed');
+  }
+  
+  // Sync session timer display with phase timer
+  function startSessionTimerSync() {
+    if (!sessionTimerInterval) {
+      sessionTimerInterval = setInterval(updateSessionTimerDisplay, 1000);
+      updateSessionTimerDisplay();
+      console.log('Session timer sync started');
+    }
+  }
+  
+  function stopSessionTimerSync() {
+    if (sessionTimerInterval) {
+      clearInterval(sessionTimerInterval);
+      sessionTimerInterval = null;
+      console.log('Session timer sync stopped');
+    }
+    
+    // Update the display to show final time
+    if (sessionTimer) {
+      const phaseState = (window as any).phaseTimerState;
+      if (phaseState && phaseState.totalElapsed > 0) {
+        const minutes = Math.floor(phaseState.totalElapsed / 60);
+        const seconds = phaseState.totalElapsed % 60;
+        if (minutes > 0) {
+          sessionTimer.textContent = `Session completed: ${minutes}:${seconds.toString().padStart(2, '0')}`;
+        } else {
+          sessionTimer.textContent = `Session completed: ${seconds} second${seconds !== 1 ? 's' : ''}`;
+        }
+      }
+    }
+  }
+  
+  function updateSessionTimerDisplay() {
+    if (!sessionTimer) return;
+    
+    const phaseState = (window as any).phaseTimerState;
+    if (phaseState) {
+      const minutes = Math.floor(phaseState.totalElapsed / 60);
+      const seconds = phaseState.totalElapsed % 60;
+      sessionTimer.textContent = `Session time: ${minutes}:${seconds.toString().padStart(2, '0')}`;
+    }
+  }
+  
+  function getSessionDurationSeconds(): number {
+    const phaseState = (window as any).phaseTimerState;
+    return phaseState ? phaseState.totalElapsed : 0;
+  }
+  
+  // Draft management functions
+  function saveDraft() {
+    if (!content) return;
+    
+    const draftData = {
+      content: content.value,
+      timestamp: Date.now(),
+      originalContent: originalContent,
+      hasLoadedExistingSession: hasLoadedExistingSession
+    };
+    
+    localStorage.setItem(draftKey, JSON.stringify(draftData));
+    
+    if (saveStatus) {
+      saveStatus.textContent = 'Draft saved locally';
+        setTimeout(() => {
+        if (saveStatus) saveStatus.textContent = 'Auto-drafting enabled';
+      }, 1000);
+    }
+  }
+  
+  function loadDraft() {
+    const draftData = localStorage.getItem(draftKey);
+    if (!draftData) return null;
+    
+    try {
+      return JSON.parse(draftData);
+    } catch {
+      return null;
+    }
+  }
+  
+  function clearDraft() {
+    localStorage.removeItem(draftKey);
+  }
+  
+  function showDraftRecovery(draft: any) {
+    const draftAge = Date.now() - draft.timestamp;
+    const ageMinutes = Math.floor(draftAge / 60000);
+    
+    if (ageMinutes < 1) {
+      console.log('Draft is very recent, auto-recovering');
+      recoverDraft(draft);
+    } else {
+      const shouldRecover = confirm(
+        `Found unsaved draft from ${ageMinutes} minute${ageMinutes !== 1 ? 's' : ''} ago.\n\nRecover draft content?`
+      );
+      
+      if (shouldRecover) {
+        recoverDraft(draft);
+      } else {
+        clearDraft();
+      }
+    }
+  }
+  
+  function recoverDraft(draft: any) {
+    if (content) {
+      content.value = draft.content;
+    }
+    
+    originalContent = draft.originalContent || '';
+    hasLoadedExistingSession = draft.hasLoadedExistingSession || false;
+    
+    // Start syncing with phase timer
+    startSessionTimerSync();
+    
+    if (saveStatus) {
+      saveStatus.textContent = 'Draft recovered';
+      setTimeout(() => {
+        if (saveStatus) saveStatus.textContent = 'Auto-drafting enabled';
+        }, 2000);
+    }
+  }
+  
+  function getNewContent(): string {
+    if (!content) return '';
+    
+    // With the new UI design, the textarea only contains new content
+    // The previous content is shown separately in a read-only area
+    return content.value.trim();
+  }
+  
+  function getAllContent(): string {
+    // For overwrite mode, we need to combine previous + new content
+    const newContent = content?.value.trim() || '';
+    
+    if (hasLoadedExistingSession && originalContent && newContent) {
+      return originalContent + '\n\n' + newContent;
+    } else if (hasLoadedExistingSession && originalContent) {
+      return originalContent;
+    } else {
+      return newContent;
+    }
+  }
+  
+  function showSessionWarning(data: any) {
+    if (hasShownWarning || !sessionWarning || !warningMessage) return;
+    
+    hasShownWarning = true;
+    existingSessionData = data;
+    
+    const existingDurationSeconds = data.existingData.duration_seconds || 0;
+    const existingMinutes = Math.floor(existingDurationSeconds / 60);
+    const existingSecondsRemainder = existingDurationSeconds % 60;
+    let durationText;
+    if (existingMinutes > 0) {
+      durationText = `${existingMinutes}:${existingSecondsRemainder.toString().padStart(2, '0')}`;
+    } else {
+      durationText = `${existingSecondsRemainder} second${existingSecondsRemainder !== 1 ? 's' : ''}`;
+    }
+    warningMessage.textContent = `Found existing session (${durationText}). Choose how to proceed:`;
+    sessionWarning.classList.remove('hidden');
+  }
+  
+  function hideSessionWarning() {
+    if (sessionWarning) {
+      sessionWarning.classList.add('hidden');
+    }
+  }
+  
+  async function saveSession(forceAppend = false, skipWarning = false) {
+    const contentToSave = getNewContent();
+    if (!contentToSave.trim()) return;
+    
+    if (saveStatus) saveStatus.textContent = 'Saving...';
+    
+    const response = await fetch('/api/vault', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'save',
+        content: contentToSave,
+        phase: (window as any).currentPhase || 'Opening',
+        duration_seconds: getSessionDurationSeconds(),
+        isAppend: isAppendMode || forceAppend
+      })
+    });
+    
+    const data = await response.json();
+    
+    if (response.status === 409 && data.exists && !forceAppend && !skipWarning) {
+      // Session exists, show static warning (only once)
+      existingSessionData = data;
+      showSessionWarning(data);
+      if (saveStatus) saveStatus.textContent = 'Waiting for user choice...';
+      return;
+    } else if (response.ok) {
+      hideSessionWarning();
+      if (saveStatus) saveStatus.textContent = isAppendMode ? 'Appended' : 'Saved';
+      
+      // Stop the main timer when save is successful
+      const timerControls = (window as any).phaseTimerControls;
+      if (timerControls && timerControls.isRunning) {
+        console.log('Stopping timer because save was successful');
+        timerControls.stop();
+      }
+      
+      // Stop the timer sync after successful save
+      stopSessionTimerSync();
+      
+      // Clear draft after successful save
+      clearDraft();
+      
+      setTimeout(() => {
+        if (saveStatus) saveStatus.textContent = 'Auto-drafting enabled';
+      }, 2000);
+    } else {
+      if (saveStatus) saveStatus.textContent = 'Save failed';
+      console.error('Save error:', data);
+    }
+  }
+  
+  function autoDraft() {
+    clearTimeout(saveTimeout);
+    saveTimeout = setTimeout(() => {
+      saveDraft();
+    }, 2000); // Save draft every 2 seconds instead of 5
+  }
+  
+  // Event handlers
+  content?.addEventListener('input', (e) => {
+    console.log('Input event triggered, content length:', content?.value.length);
+    
+    // Auto-start timer when user begins writing
+    const timerControls = (window as any).phaseTimerControls;
+    if (timerControls && !timerControls.isRunning && content?.value.trim()) {
+      console.log('Auto-starting timer because user started writing');
+      timerControls.start();
+    }
+    
+    // Start syncing session timer display with phase timer
+    startSessionTimerSync();
+    autoDraft(); // Save draft instead of auto-save
+  });
+  
+  content?.addEventListener('blur', () => {
+    clearTimeout(saveTimeout);
+    // Just save draft on blur, don't auto-save to file
+    saveDraft();
+  });
+  
+  saveButton?.addEventListener('click', () => {
+    clearTimeout(saveTimeout);
+    saveSession(false, hasShownWarning && isAppendMode);
+  });
+  
+  // Handle append/overwrite buttons
+  appendBtn?.addEventListener('click', () => {
+    isAppendMode = true;
+    hideSessionWarning();
+    
+    // Update status immediately
+    if (saveStatus) saveStatus.textContent = 'Appending...';
+    
+    // When user chooses to append, show the existing content in read-only area
+    if (existingSessionData && existingSessionData.existingContent) {
+      originalContent = existingSessionData.existingContent;
+      hasLoadedExistingSession = true;
+      
+      // Show existing content in read-only area
+      if (previousContent && previousContentSection) {
+        previousContent.textContent = originalContent;
+        previousContentSection.classList.remove('hidden');
+      }
+      
+      // Update labels for append mode
+      if (contentAreaTitle) {
+        contentAreaTitle.textContent = 'Continue Your Entry';
+      }
+      if (contentAreaSubtitle) {
+        contentAreaSubtitle.textContent = 'Add new thoughts to your existing session...';
+      }
+    }
+    
+    saveSession(true, true);
+  });
+  
+  overwriteBtn?.addEventListener('click', async () => {
+    isAppendMode = false;
+    hideSessionWarning();
+    
+    // Update status immediately
+    if (saveStatus) saveStatus.textContent = 'Overwriting...';
+    
+    // For overwrite, use all content (previous + new)
+    const contentToSave = getAllContent();
+    
+    try {
+      const response = await fetch('/api/vault', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'save',
+          content: contentToSave,
+          phase: (window as any).currentPhase || 'Opening',
+          duration_seconds: getSessionDurationSeconds(),
+          isAppend: false,
+          forceOverwrite: true  // Add explicit flag for overwrite
+        })
+      });
+      
+      if (response.ok) {
+        if (saveStatus) saveStatus.textContent = 'Saved (overwritten)';
+        
+        // Stop the main timer when overwrite is successful
+        const timerControls = (window as any).phaseTimerControls;
+        if (timerControls && timerControls.isRunning) {
+          console.log('Stopping timer because overwrite was successful');
+          timerControls.stop();
+        }
+        
+        // Stop the timer sync after successful overwrite
+        stopSessionTimerSync();
+        
+        // Clear draft after successful save
+        clearDraft();
+        
+        setTimeout(() => {
+          if (saveStatus) saveStatus.textContent = 'Auto-drafting enabled';
+        }, 2000);
+      } else {
+        if (saveStatus) saveStatus.textContent = 'Overwrite failed';
+        console.error('Overwrite failed:', await response.text());
+      }
+    } catch (error) {
+      if (saveStatus) saveStatus.textContent = 'Overwrite error';
+      console.error('Overwrite error:', error);
+    }
+  });
+  
+  // Auto-start timer on dictation
+  document.addEventListener('dictation-started', () => {
+    console.log('Dictation started event received');
+    
+    // Auto-start timer when user begins dictating
+    const timerControls = (window as any).phaseTimerControls;
+    if (timerControls && !timerControls.isRunning) {
+      console.log('Auto-starting timer because user started dictating');
+      timerControls.start();
+    }
+    
+    startSessionTimerSync();
+  });
+  
+  // Save draft when dictation finishes (don't auto-save to file)
+  document.addEventListener('dictation-finished', () => {
+    console.log('Dictation finished event received');
+    // Clear any pending auto-draft and save draft immediately
+    clearTimeout(saveTimeout);
+    if (content?.value.trim()) {
+      console.log('Saving draft after dictation');
+      saveDraft();
+    }
+  });
+  
+  // Cleanup on page unload
+  window.addEventListener('beforeunload', () => {
+    if (sessionTimerInterval) clearInterval(sessionTimerInterval);
+    if (saveTimeout) clearTimeout(saveTimeout);
+  });
+</script>
+
+<script define:vars={{ session }}>
+  // Make session data available to client-side JavaScript
+  window.sessionData = session;
+</script>

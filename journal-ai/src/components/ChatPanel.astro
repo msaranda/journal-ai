@@ -1,0 +1,19 @@
+---
+import Chat from '../islands/Chat';
+const { settings } = Astro.props;
+---
+
+<div class="bg-white dark:bg-neutral-950 rounded-xl border border-neutral-200 dark:border-neutral-800 h-[600px] flex flex-col">
+  <div class="border-b border-neutral-200 dark:border-neutral-800 p-4">
+    <h2 class="text-lg font-medium text-neutral-900 dark:text-neutral-100">
+      Journal Assistant
+    </h2>
+    <p class="text-sm text-neutral-500 mt-1">
+      Reflect, explore patterns, get insights
+    </p>
+  </div>
+  
+  <div class="flex-1 overflow-hidden">
+    <Chat settings={settings} client:load />
+  </div>
+</div>
