@@ -1,7 +1,7 @@
 import type { APIRoute } from 'astro';
 import { VaultManager } from '../../lib/vault';
 import { RAGSystem } from '../../lib/rag';
-import type { SessionFrontMatter } from '../../types';
+import type { SessionFrontMatter, EntryMetadata } from '../../types';
 
 export const POST: APIRoute = async ({ request }) => {
   const data = await request.json();
@@ -33,6 +33,9 @@ export const POST: APIRoute = async ({ request }) => {
       }
       if (data.phase) {
         frontMatter.phase = data.phase;
+      }
+      if (data.session_start) {
+        frontMatter.session_start = data.session_start;
       }
       
       const result = await vault.saveSession(data.content, frontMatter, data.isAppend, data.forceOverwrite);
@@ -68,6 +71,37 @@ export const POST: APIRoute = async ({ request }) => {
         status: 200,
         headers: { 'Content-Type': 'application/json' }
       });
+    }
+    
+    if (data.action === 'save_entry') {
+      const metadata: EntryMetadata = data.metadata;
+      const result = await vault.saveEntry(data.content, metadata);
+      
+      if (result.success) {
+        // Index the document for RAG with settings
+        const settings = await vault.loadSettings();
+        const rag = new RAGSystem(vault['vaultPath'], settings);
+        
+        // Create a simple frontmatter for RAG indexing
+        const simpleFrontMatter = {
+          date: metadata.started_at.split('T')[0],
+          duration_seconds: metadata.duration_seconds,
+          entry_number: metadata.entry_number
+        };
+        
+        await rag.indexDocument(result.filepath, data.content, simpleFrontMatter);
+        rag.close();
+        
+        return new Response(JSON.stringify({ success: true, filepath: result.filepath }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      } else {
+        return new Response(JSON.stringify({ error: 'Save failed' }), {
+          status: 500,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
     }
     
     if (data.action === 'recent') {

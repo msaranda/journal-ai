@@ -2,7 +2,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import matter from 'gray-matter';
 import { format } from 'date-fns';
-import type { SessionFrontMatter, Settings } from '../types';
+import type { SessionFrontMatter, Settings, EntryMetadata } from '../types';
 
 export class VaultManager {
   private vaultPath: string;
@@ -93,7 +93,7 @@ export class VaultManager {
       // Append to existing session
       const appendTimestamp = new Date().toISOString();
       finalContent = existingSession.content + 
-        `\n\n---\n**Appended at ${appendTimestamp}**\n\n` + 
+        `\n\n---\n**Appended at ${appendTimestamp}**\n` + 
         content;
       
       // Merge front matter, accumulating duration
@@ -160,6 +160,67 @@ export class VaultManager {
   async saveSettings(settings: Settings) {
     const settingsPath = path.join(this.vaultPath, 'config', 'settings.json');
     await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2), 'utf-8');
+  }
+
+  async saveEntry(content: string, metadata: EntryMetadata): Promise<{ filepath: string; success: boolean }> {
+    const date = new Date();
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    
+    const sessionDir = path.join(this.vaultPath, 'sessions', String(year), month);
+    await fs.mkdir(sessionDir, { recursive: true });
+    
+    const filename = `${year}-${month}-${day}.session.md`;
+    const filepath = path.join(sessionDir, filename);
+    
+    // Load existing session or create new one
+    let existingSession: { content: string; data: SessionFrontMatter } | null = null;
+    try {
+      const existingContent = await fs.readFile(filepath, 'utf-8');
+      const parsed = matter(existingContent);
+      existingSession = { content: parsed.content, data: parsed.data as SessionFrontMatter };
+    } catch {
+      // File doesn't exist, will create new one
+    }
+    
+    // Prepare the new entry content with proper time formatting
+    const startDate = new Date(metadata.started_at);
+    const entryTime = startDate.toLocaleTimeString('en-US', { 
+      hour: '2-digit', 
+      minute: '2-digit',
+      hour12: false,
+      timeZone: 'UTC' // Use UTC to avoid timezone issues
+    });
+    const entryContent = `## ${entryTime} - Entry ${metadata.entry_number}\n${content}\n`;
+    
+    let finalContent: string;
+    let finalFrontMatter: SessionFrontMatter;
+    
+    if (existingSession) {
+      // Append to existing session
+      finalContent = existingSession.content + '\n---\n\n' + entryContent;
+      finalFrontMatter = {
+        ...existingSession.data,
+        entries_metadata: [
+          ...(existingSession.data.entries_metadata || []),
+          metadata
+        ]
+      };
+    } else {
+      // Create new session
+      const dateStr = `${year}-${month}-${day}`;
+      finalContent = `# ${dateStr}\n\n${entryContent}`;
+      finalFrontMatter = {
+        date: dateStr,
+        entries_metadata: [metadata]
+      };
+    }
+    
+    const fileContent = matter.stringify(finalContent, finalFrontMatter);
+    await fs.writeFile(filepath, fileContent, 'utf-8');
+    
+    return { filepath, success: true };
   }
 
   async loadPrompt(name: string): Promise<string> {

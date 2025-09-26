@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect } from 'react';
 import { Mic, MicOff, Circle, Square } from 'lucide-react';
 
 interface DictationProps {
-  sttEngine: 'local' | 'browser';
+  sttEngine: 'local' | 'browser' | 'openai';
   sttLanguage?: string;
 }
 
@@ -12,15 +12,72 @@ export default function Dictation({ sttEngine, sttLanguage }: DictationProps) {
   const [interim, setInterim] = useState('');
   const recognitionRef = useRef<any>(null);
   const textAreaRef = useRef<HTMLTextAreaElement>(null);
+  const silenceTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  
+  // Network and availability states
+  const [isOnline, setIsOnline] = useState(true); // Default to online, will be updated in useEffect
+  const [whisperAvailable, setWhisperAvailable] = useState<boolean | null>(null);
+  const [actualEngine, setActualEngine] = useState<string>(sttEngine);
+  const [statusMessage, setStatusMessage] = useState<string>('');
+  
+  // Audio recording refs for server-side STT
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
+  const streamRef = useRef<MediaStream | null>(null);
+  const sessionIdRef = useRef<string | null>(null);
+  const processingIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  
+  // Import timing configuration
+  const TIMING_CONFIG = {
+    dictation_silence_timeout: 10,
+    page_leave_timeout: 5,
+    typing_inactivity_timeout: 120
+  };
 
   useEffect(() => {
+    // Only run in browser environment
+    if (typeof window === 'undefined') return;
+    
+    console.log('🎤 Dictation component initializing with:', { sttEngine, sttLanguage });
+    
+    // Initialize online status from navigator
+    if (typeof navigator !== 'undefined') {
+      setIsOnline(navigator.onLine);
+    }
+    
     const textArea = document.getElementById('journal-content') as HTMLTextAreaElement;
     if (textArea) {
       (textAreaRef as any).current = textArea;
+      console.log('✅ Found textarea element');
+    } else {
+      console.error('❌ Could not find textarea with id "journal-content"');
     }
+    
+    // Set up network detection
+    const handleOnline = () => {
+      setIsOnline(true);
+      console.log('🌐 Network connection restored');
+      checkAvailabilityAndSetEngine();
+    };
+    
+    const handleOffline = () => {
+      setIsOnline(false);
+      console.log('📵 Network connection lost');
+      checkAvailabilityAndSetEngine();
+    };
+    
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+    
+    // Initial availability check (with small delay to ensure component is mounted)
+    setTimeout(() => {
+      checkAvailabilityAndSetEngine();
+    }, 100);
     
     if (sttEngine === 'browser' && typeof window !== 'undefined') {
       const SpeechRecognition = (window as any).webkitSpeechRecognition || (window as any).SpeechRecognition;
+      console.log('🔍 Speech recognition support:', !!SpeechRecognition);
+      
       if (SpeechRecognition) {
         recognitionRef.current = new SpeechRecognition();
         recognitionRef.current.continuous = true;
@@ -40,6 +97,11 @@ export default function Dictation({ sttEngine, sttLanguage }: DictationProps) {
             }
           }
           
+          // Reset silence timeout when speech is detected
+          if (final || interim) {
+            startSilenceTimeout();
+          }
+          
           if (final) {
             setTranscript(prev => prev + final);
             insertAtCursor(final);
@@ -50,17 +112,26 @@ export default function Dictation({ sttEngine, sttLanguage }: DictationProps) {
         recognitionRef.current.onerror = (event: any) => {
           console.error('Speech recognition error:', event.error);
           setIsRecording(false);
+          clearSilenceTimeout();
           document.dispatchEvent(new CustomEvent('dictation-finished'));
         };
         
         recognitionRef.current.onend = () => {
           console.log('Speech recognition ended');
           setIsRecording(false);
+          clearSilenceTimeout();
           document.dispatchEvent(new CustomEvent('dictation-finished'));
         };
       }
     }
+    
+    // Cleanup function
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+    };
   }, [sttEngine, sttLanguage]);
+
 
   const insertAtCursor = (text: string) => {
     if (!textAreaRef.current) return;
@@ -86,18 +157,19 @@ export default function Dictation({ sttEngine, sttLanguage }: DictationProps) {
   };
 
   const toggleRecording = async () => {
+    console.log('🎤 Toggle recording called, current state:', isRecording);
+    
     if (isRecording) {
-      if (sttEngine === 'browser' && recognitionRef.current) {
+      if (actualEngine === 'browser' && recognitionRef.current) {
         recognitionRef.current.stop();
-      } else if (sttEngine === 'local') {
-        // Stop local recording
-        await fetch('/api/stt', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ action: 'stop' })
-        });
+      } else if (actualEngine === 'local' || actualEngine === 'openai') {
+        // Stop audio recording and streaming
+        stopAudioRecording();
       }
       setIsRecording(false);
+      
+      // Clear silence timeout when stopping
+      clearSilenceTimeout();
       
       // Emit event when dictation finishes
       document.dispatchEvent(new CustomEvent('dictation-finished'));
@@ -112,21 +184,90 @@ export default function Dictation({ sttEngine, sttLanguage }: DictationProps) {
         textarea.selectionStart = textarea.selectionEnd = textarea.value.length;
       }
       
-      if (sttEngine === 'browser' && recognitionRef.current) {
-        recognitionRef.current.start();
-        // Emit event to start session timer
-        document.dispatchEvent(new CustomEvent('dictation-started'));
-      } else if (sttEngine === 'local') {
-        // Start local recording
-        const response = await fetch('/api/stt', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ action: 'start', language: sttLanguage || 'en' })
-        });
-        
-        if (response.ok) {
-          // Poll for transcripts
-          pollTranscripts();
+      if (actualEngine === 'browser' && recognitionRef.current) {
+        try {
+          console.log('🎤 Starting browser speech recognition...');
+          recognitionRef.current.start();
+          // Start silence timeout for auto-stop
+          startSilenceTimeout();
+          // Emit event to start session timer
+          document.dispatchEvent(new CustomEvent('dictation-started'));
+          console.log('✅ Speech recognition started successfully');
+        } catch (error) {
+          console.error('❌ Failed to start speech recognition:', error);
+          setIsRecording(false);
+          return;
+        }
+      } else if (actualEngine === 'local' || actualEngine === 'openai') {
+        try {
+          console.log(`🎤 Starting ${actualEngine} STT with audio streaming...`);
+          await startAudioRecording();
+          startSilenceTimeout();
+          console.log(`✅ ${actualEngine} STT started successfully`);
+        } catch (error) {
+          console.error(`❌ ${sttEngine} STT failed:`, error);
+          console.log('🔄 Falling back to browser STT...');
+          
+          // Fallback to browser STT
+          const SpeechRecognition = (window as any).webkitSpeechRecognition || (window as any).SpeechRecognition;
+          if (SpeechRecognition && !recognitionRef.current) {
+            recognitionRef.current = new SpeechRecognition();
+            recognitionRef.current.continuous = true;
+            recognitionRef.current.interimResults = true;
+            recognitionRef.current.lang = sttLanguage || 'en-US';
+            
+            // Set up event handlers for fallback
+            recognitionRef.current.onresult = (event: any) => {
+              let interim = '';
+              let final = '';
+              
+              for (let i = event.resultIndex; i < event.results.length; i++) {
+                const transcript = event.results[i][0].transcript;
+                if (event.results[i].isFinal) {
+                  final += transcript + ' ';
+                } else {
+                  interim += transcript;
+                }
+              }
+              
+              if (final || interim) {
+                startSilenceTimeout();
+              }
+              
+              if (final) {
+                setTranscript(prev => prev + final);
+                insertAtCursor(final);
+              }
+              setInterim(interim);
+            };
+            
+            recognitionRef.current.onerror = (event: any) => {
+              console.error('Speech recognition error:', event.error);
+              setIsRecording(false);
+              clearSilenceTimeout();
+            };
+            
+            recognitionRef.current.onend = () => {
+              setIsRecording(false);
+              clearSilenceTimeout();
+            };
+          }
+          
+          if (recognitionRef.current) {
+            try {
+              recognitionRef.current.start();
+              startSilenceTimeout();
+              console.log('✅ Fallback browser STT started');
+            } catch (fallbackError) {
+              console.error('❌ Fallback browser STT also failed:', fallbackError);
+              setIsRecording(false);
+              return;
+            }
+          } else {
+            console.error('❌ No STT options available');
+            setIsRecording(false);
+            return;
+          }
         }
       }
       setIsRecording(true);
@@ -146,10 +287,14 @@ export default function Dictation({ sttEngine, sttLanguage }: DictationProps) {
       if (data.transcript) {
         setTranscript(prev => prev + data.transcript);
         insertAtCursor(data.transcript);
+        // Reset silence timeout when we get new transcript
+        startSilenceTimeout();
       }
       
       if (data.interim) {
         setInterim(data.interim);
+        // Reset silence timeout for interim results too
+        startSilenceTimeout();
       }
       
       if (isRecording) {
@@ -162,6 +307,369 @@ export default function Dictation({ sttEngine, sttLanguage }: DictationProps) {
 
   const addPunctuation = (mark: string) => {
     insertAtCursor(mark + ' ');
+  };
+
+  const startSilenceTimeout = () => {
+    // Clear any existing timeout
+    if (silenceTimeoutRef.current) {
+      clearTimeout(silenceTimeoutRef.current);
+    }
+    
+    // Start configurable timeout
+    const timeout = TIMING_CONFIG.dictation_silence_timeout * 1000; // Convert to milliseconds
+    silenceTimeoutRef.current = setTimeout(() => {
+      console.log(`Stopping dictation due to ${TIMING_CONFIG.dictation_silence_timeout} seconds of silence`);
+      if (isRecording) {
+        // Stop recording due to silence
+        toggleRecording();
+      }
+    }, timeout);
+  };
+
+  const clearSilenceTimeout = () => {
+    if (silenceTimeoutRef.current) {
+      clearTimeout(silenceTimeoutRef.current);
+      silenceTimeoutRef.current = null;
+    }
+  };
+
+  // Audio recording functions for server-side STT
+  const startAudioRecording = async () => {
+    try {
+      console.log('🎤 Requesting microphone access...');
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+        audio: {
+          sampleRate: 16000,
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true
+        } 
+      });
+      
+      streamRef.current = stream;
+      console.log('✅ Microphone access granted');
+
+      // Generate session ID
+      const sessionId = generateSessionId();
+      sessionIdRef.current = sessionId;
+
+      // Start STT session on server
+      const startResponse = await fetch('/api/stt-stream', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'start',
+          sessionId,
+          language: sttLanguage || 'en'
+        })
+      });
+
+      if (!startResponse.ok) {
+        throw new Error('Failed to start STT session');
+      }
+
+      const startResult = await startResponse.json();
+      console.log('✅ STT session started:', startResult);
+
+      // Create MediaRecorder for audio capture
+      const mediaRecorder = new MediaRecorder(stream, {
+        mimeType: 'audio/webm;codecs=opus'
+      });
+      
+      mediaRecorderRef.current = mediaRecorder;
+      audioChunksRef.current = [];
+
+      // Handle audio data
+      mediaRecorder.ondataavailable = async (event) => {
+        if (event.data.size > 0) {
+          audioChunksRef.current.push(event.data);
+          
+          // Send audio chunk to server
+          try {
+            const arrayBuffer = await event.data.arrayBuffer();
+            const audioData = Array.from(new Uint8Array(arrayBuffer));
+            
+            await fetch('/api/stt-stream', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                action: 'audio',
+                sessionId,
+                audioData
+              })
+            });
+          } catch (error) {
+            console.error('❌ Failed to send audio chunk:', error);
+          }
+        }
+      };
+
+      mediaRecorder.onstop = () => {
+        console.log('🛑 MediaRecorder stopped');
+      };
+
+      // Start recording with chunks for streaming
+      mediaRecorder.start(1000); // 1 second chunks
+      console.log('🎤 Audio recording started');
+
+      // Start periodic processing
+      startPeriodicProcessing();
+      
+      return true;
+    } catch (error) {
+      console.error('❌ Failed to start audio recording:', error);
+      throw error;
+    }
+  };
+
+  const stopAudioRecording = async () => {
+    console.log('🛑 Stopping audio recording...');
+    
+    // Stop periodic processing
+    if (processingIntervalRef.current) {
+      clearInterval(processingIntervalRef.current);
+      processingIntervalRef.current = null;
+    }
+    
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      mediaRecorderRef.current.stop();
+    }
+    
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop());
+      streamRef.current = null;
+    }
+    
+    // End STT session and get final transcript
+    if (sessionIdRef.current) {
+      try {
+        const endResponse = await fetch('/api/stt-stream', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            action: 'end',
+            sessionId: sessionIdRef.current
+          })
+        });
+        
+        if (endResponse.ok) {
+          const result = await endResponse.json();
+          if (result.finalTranscript) {
+            setTranscript(prev => prev + result.finalTranscript + ' ');
+            insertAtCursor(result.finalTranscript + ' ');
+          }
+        }
+      } catch (error) {
+        console.error('❌ Failed to end STT session:', error);
+      }
+    }
+    
+    mediaRecorderRef.current = null;
+    sessionIdRef.current = null;
+    audioChunksRef.current = [];
+    
+    console.log('✅ Audio recording stopped');
+  };
+
+  const startPeriodicProcessing = () => {
+    // Process audio every 2 seconds for real-time transcription
+    processingIntervalRef.current = setInterval(async () => {
+      if (sessionIdRef.current) {
+        try {
+          const processResponse = await fetch('/api/stt-stream', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              action: 'process',
+              sessionId: sessionIdRef.current
+            })
+          });
+          
+          if (processResponse.ok) {
+            const result = await processResponse.json();
+            if (result.transcript && result.transcript.trim()) {
+              console.log('📝 Received transcript:', result.transcript);
+              
+              if (result.is_final) {
+                setTranscript(prev => prev + result.transcript + ' ');
+                insertAtCursor(result.transcript + ' ');
+                setInterim('');
+              } else {
+                setInterim(result.transcript);
+              }
+              
+              // Reset silence timeout on new transcript
+              startSilenceTimeout();
+            }
+          }
+        } catch (error) {
+          console.error('❌ Failed to process audio:', error);
+        }
+      }
+    }, 2000); // Process every 2 seconds
+  };
+
+  const generateSessionId = (): string => {
+    return Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
+  };
+
+  const checkAvailabilityAndSetEngine = async () => {
+    // Only run in browser environment
+    if (typeof window === 'undefined') return;
+    
+    console.log('🔍 Checking STT availability...');
+    
+    let finalEngine = sttEngine;
+    let message = '';
+    
+    // Get current online status
+    const currentOnlineStatus = typeof navigator !== 'undefined' ? navigator.onLine : true;
+    setIsOnline(currentOnlineStatus);
+    
+    // Check network status first
+    if (!currentOnlineStatus) {
+      console.log('📵 Offline - forcing browser STT');
+      finalEngine = 'browser';
+      message = '🔴 Offline - Using browser STT';
+      setWhisperAvailable(false);
+    } else {
+      // Online - check server-side options
+      if (sttEngine === 'local' || sttEngine === 'openai') {
+        try {
+          // Test server connectivity and Whisper availability
+          const response = await fetch('/api/stt-stream', {
+            method: 'GET',
+            signal: AbortSignal.timeout(3000) // 3 second timeout
+          });
+          
+          if (response.ok) {
+            // Server is reachable, check if Whisper is available
+            const testSession = generateSessionId();
+            const testResponse = await fetch('/api/stt-stream', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                action: 'start',
+                sessionId: testSession,
+                language: sttLanguage || 'en'
+              }),
+              signal: AbortSignal.timeout(3000)
+            });
+            
+            if (testResponse.ok) {
+              const result = await testResponse.json();
+              
+              if (sttEngine === 'local') {
+                // Try to detect if local Whisper is available
+                setWhisperAvailable(true);
+                finalEngine = 'local';
+                message = '🟢 Local Whisper available';
+              } else if (sttEngine === 'openai') {
+                setWhisperAvailable(true);
+                finalEngine = 'openai';
+                message = '🟢 OpenAI Whisper available';
+              }
+              
+              // Clean up test session
+              await fetch('/api/stt-stream', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  action: 'end',
+                  sessionId: testSession
+                })
+              }).catch(() => {}); // Ignore cleanup errors
+              
+            } else {
+              throw new Error('STT session creation failed');
+            }
+          } else {
+            throw new Error('Server not reachable');
+          }
+        } catch (error) {
+          console.log(`❌ ${sttEngine} STT not available:`, error);
+          setWhisperAvailable(false);
+          
+          if (sttEngine === 'local') {
+            message = '🟡 Local Whisper unavailable - Using browser STT';
+          } else if (sttEngine === 'openai') {
+            message = '🟡 OpenAI Whisper unavailable - Using browser STT';
+          }
+          
+          finalEngine = 'browser';
+        }
+      } else {
+        // Browser STT selected
+        finalEngine = 'browser';
+        message = '🔵 Browser STT selected';
+        setWhisperAvailable(null);
+      }
+    }
+    
+    setActualEngine(finalEngine);
+    setStatusMessage(message);
+    
+    console.log(`🎯 Final STT engine: ${finalEngine} (requested: ${sttEngine})`);
+    
+    // Ensure browser STT is initialized if we're using it
+    if (finalEngine === 'browser') {
+      initializeBrowserSTT();
+    }
+  };
+
+  const initializeBrowserSTT = () => {
+    if (typeof window !== 'undefined' && !recognitionRef.current) {
+      const SpeechRecognition = (window as any).webkitSpeechRecognition || (window as any).SpeechRecognition;
+      
+      if (SpeechRecognition) {
+        recognitionRef.current = new SpeechRecognition();
+        recognitionRef.current.continuous = true;
+        recognitionRef.current.interimResults = true;
+        recognitionRef.current.lang = sttLanguage || 'en-US';
+        
+        recognitionRef.current.onresult = (event: any) => {
+          let interim = '';
+          let final = '';
+          
+          for (let i = event.resultIndex; i < event.results.length; i++) {
+            const transcript = event.results[i][0].transcript;
+            if (event.results[i].isFinal) {
+              final += transcript + ' ';
+            } else {
+              interim += transcript;
+            }
+          }
+          
+          if (final || interim) {
+            startSilenceTimeout();
+          }
+          
+          if (final) {
+            setTranscript(prev => prev + final);
+            insertAtCursor(final);
+          }
+          setInterim(interim);
+        };
+        
+        recognitionRef.current.onerror = (event: any) => {
+          console.error('Speech recognition error:', event.error);
+          setIsRecording(false);
+          clearSilenceTimeout();
+          document.dispatchEvent(new CustomEvent('dictation-finished'));
+        };
+        
+        recognitionRef.current.onend = () => {
+          console.log('Speech recognition ended');
+          setIsRecording(false);
+          clearSilenceTimeout();
+          document.dispatchEvent(new CustomEvent('dictation-finished'));
+        };
+        
+        console.log('✅ Browser STT initialized');
+      } else {
+        console.error('❌ Browser STT not supported');
+      }
+    }
   };
 
   return (
@@ -208,11 +716,45 @@ export default function Dictation({ sttEngine, sttLanguage }: DictationProps) {
           </button>
         </div>
         
-        {sttEngine === 'browser' && (
-          <div className="text-xs text-amber-600 dark:text-amber-400">
-            ⚠️ Browser STT (not private)
-          </div>
-        )}
+        {/* STT Engine Status */}
+        <div className="flex flex-col text-xs">
+          {statusMessage && (
+            <div className={`px-2 py-1 rounded text-xs font-medium ${
+              statusMessage.includes('🔴') 
+                ? 'bg-red-100 text-red-700 dark:bg-red-900 dark:text-red-300'
+                : statusMessage.includes('🟡')
+                ? 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900 dark:text-yellow-300'
+                : statusMessage.includes('🟢')
+                ? 'bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300'
+                : 'bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300'
+            }`}>
+              {statusMessage}
+            </div>
+          )}
+          
+          {actualEngine === 'browser' && (
+            <div className="text-amber-600 dark:text-amber-400 mt-1">
+              ⚠️ Browser STT (not private)
+            </div>
+          )}
+          
+          {!isOnline && (
+            <div className="text-red-600 dark:text-red-400 mt-1">
+              📵 No internet connection
+            </div>
+          )}
+          
+          {/* Retry button for failed connections */}
+          {(whisperAvailable === false || !isOnline) && (
+            <button
+              onClick={checkAvailabilityAndSetEngine}
+              className="mt-1 px-2 py-1 text-xs bg-neutral-200 hover:bg-neutral-300 dark:bg-neutral-700 dark:hover:bg-neutral-600 rounded"
+              disabled={isRecording}
+            >
+              🔄 Retry
+            </button>
+          )}
+        </div>
       </div>
       
       {/* Live Transcript */}

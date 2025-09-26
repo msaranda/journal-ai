@@ -1,11 +1,13 @@
 import type { APIRoute } from 'astro';
 import { spawn } from 'child_process';
+import { OpenAI } from 'openai';
+import { VaultManager } from '../../lib/vault';
 
 // Simple in-memory store for STT sessions
 const sttSessions = new Map();
 
 export const POST: APIRoute = async ({ request }) => {
-  const { action, language } = await request.json();
+  const { action, language, audio, settings } = await request.json();
   const sessionId = request.headers.get('x-session-id') || 'default';
   
   if (action === 'start') {

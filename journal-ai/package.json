@@ -10,23 +10,25 @@
     "setup": "tsx scripts/setup.ts"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.20.0",
     "@astrojs/react": "^3.0.0",
     "@astrojs/tailwind": "^5.0.0",
-    "@anthropic-ai/sdk": "^0.20.0",
+    "@types/ws": "^8.18.1",
     "astro": "^4.0.0",
+    "better-sqlite3": "^9.0.0",
+    "date-fns": "^3.0.0",
+    "gray-matter": "^4.0.3",
+    "lucide-react": "^0.300.0",
+    "openai": "^4.0.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
-    "better-sqlite3": "^9.0.0",
-    "gray-matter": "^4.0.3",
-    "date-fns": "^3.0.0",
-    "openai": "^4.0.0",
-    "lucide-react": "^0.300.0"
+    "ws": "^8.18.3"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.0",
     "@types/react": "^18.2.0",
     "tailwindcss": "^3.4.0",
-    "typescript": "^5.3.0",
-    "tsx": "^4.0.0"
+    "tsx": "^4.0.0",
+    "typescript": "^5.3.0"
   }
 }

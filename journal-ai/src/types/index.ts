@@ -1,6 +1,25 @@
+export interface EntryMetadata {
+  entry_number: number;
+  started_at: string;
+  first_keystroke_at: string;
+  finished_at: string;
+  duration_seconds: number;
+  total_keystrokes: number;
+  backspaces: number;
+  paste_events: number;
+  pauses: number[];
+  max_pause: number;
+  time_since_last_entry: number;
+  word_count: number;
+  char_count: number;
+  line_count: number;
+}
+
 export interface SessionFrontMatter {
   date: string;
-  duration_seconds: number;
+  entries_metadata: EntryMetadata[];
+  // Legacy fields for backward compatibility
+  duration_seconds?: number;
   tags?: string[];
   mood?: number;
   problems?: Problem[];
@@ -10,6 +29,7 @@ export interface SessionFrontMatter {
     letting_go: string;
   };
   phase?: string;
+  session_start?: string;
   appended_sessions?: Array<{
     timestamp: string;
     duration_seconds: number;
