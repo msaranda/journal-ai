@@ -16,6 +16,27 @@ interface STTSession {
 // In-memory session storage (in production, use Redis or similar)
 const sessions = new Map<string, STTSession>();
 
+// Convert locale language codes (e.g., 'pl-PL', 'en-US') to ISO-639-1 format (e.g., 'pl', 'en')
+const convertToISO639_1 = (languageCode: string): string => {
+  if (!languageCode) return 'en';
+  
+  // If it's already in ISO-639-1 format (2 letters), return as is
+  if (languageCode.length === 2) {
+    return languageCode.toLowerCase();
+  }
+  
+  // Extract the first part before the dash/underscore
+  const iso639_1 = languageCode.split(/[-_]/)[0].toLowerCase();
+  
+  // Validate it's a 2-letter code
+  if (iso639_1.length === 2) {
+    return iso639_1;
+  }
+  
+  // Fallback to English if invalid
+  return 'en';
+};
+
 // Cleanup inactive sessions every 5 minutes
 setInterval(() => {
   const now = Date.now();
@@ -41,10 +62,10 @@ export const POST: APIRoute = async ({ request }) => {
         return handleAudioChunk(sessionId, audioData);
         
       case 'process':
-        return handleProcessAudio(sessionId);
+        return handleProcessAudio(sessionId, audioData);
         
       case 'end':
-        return handleEndSession(sessionId);
+        return handleEndSession(sessionId, audioData);
         
       default:
         return new Response(JSON.stringify({ error: 'Invalid action' }), {
@@ -65,7 +86,8 @@ export const POST: APIRoute = async ({ request }) => {
 };
 
 const handleStartSession = async (sessionId: string, language: string, settings: any) => {
-  console.log(`🎤 Starting STT session: ${sessionId}`);
+  const convertedLanguage = convertToISO639_1(language || 'en');
+  console.log(`🎤 Starting STT session: ${sessionId}, language: ${language} -> ${convertedLanguage}`);
   
   // Load vault settings if not provided
   let sttSettings = settings;
@@ -86,7 +108,7 @@ const handleStartSession = async (sessionId: string, language: string, settings:
   
   const session: STTSession = {
     id: sessionId,
-    language: language || 'en',
+    language: convertedLanguage,
     audioChunks: [],
     lastActivity: Date.now(),
     settings: sttSettings
@@ -127,7 +149,7 @@ const handleAudioChunk = async (sessionId: string, audioData: number[]) => {
   });
 };
 
-const handleProcessAudio = async (sessionId: string) => {
+const handleProcessAudio = async (sessionId: string, audioData?: number[]) => {
   const session = sessions.get(sessionId);
   if (!session) {
     return new Response(JSON.stringify({ error: 'Session not found' }), {
@@ -137,6 +159,15 @@ const handleProcessAudio = async (sessionId: string) => {
   }
   
   session.lastActivity = Date.now();
+  
+  // If audioData is provided, use it directly (complete WebM blob)
+  if (audioData && Array.isArray(audioData)) {
+    const audioBuffer = Buffer.from(audioData);
+    console.log(`📦 Received complete audio data: ${audioBuffer.length} bytes`);
+    
+    // Replace session chunks with the complete audio
+    session.audioChunks = [audioBuffer];
+  }
   
   if (session.audioChunks.length === 0) {
     return new Response(JSON.stringify({ 
@@ -182,7 +213,7 @@ const handleProcessAudio = async (sessionId: string) => {
   }
 };
 
-const handleEndSession = async (sessionId: string) => {
+const handleEndSession = async (sessionId: string, audioData?: number[]) => {
   const session = sessions.get(sessionId);
   if (!session) {
     return new Response(JSON.stringify({ error: 'Session not found' }), {
@@ -193,12 +224,19 @@ const handleEndSession = async (sessionId: string) => {
   
   console.log(`🛑 Ending STT session: ${sessionId}`);
   
-  // Process any remaining audio
+  // If audioData is provided, use it for final processing
+  if (audioData && Array.isArray(audioData)) {
+    const audioBuffer = Buffer.from(audioData);
+    console.log(`📦 Received final audio data: ${audioBuffer.length} bytes`);
+    session.audioChunks = [audioBuffer];
+  }
+  
+  // Process any remaining audio - for final processing, we want to process all chunks
   let finalTranscript = '';
   if (session.audioChunks.length > 0) {
     try {
       if (session.settings.stt_engine === 'openai') {
-        finalTranscript = await processWithOpenAIWhisper(session);
+        finalTranscript = await processAllChunksWithOpenAI(session);
       } else {
         finalTranscript = await processWithLocalWhisper(session);
       }
@@ -311,19 +349,27 @@ const processWithOpenAIWhisper = async (session: STTSession): Promise<string> =>
     apiKey: session.settings.api_key
   });
   
-  // Combine all audio chunks
-  const audioData = Buffer.concat(session.audioChunks);
-  
-  if (audioData.length < 1000) {
-    return ''; // Skip very small audio chunks
+  // Process the complete WebM audio data
+  if (session.audioChunks.length === 0) {
+    return '';
   }
   
-  // Create temporary audio file for OpenAI
+  // Use the complete audio data (should be a single complete WebM file now)
+  const audioData = session.audioChunks.length === 1 ? 
+    session.audioChunks[0] : 
+    Buffer.concat(session.audioChunks);
+  
+  if (audioData.length < 1000) {
+    return ''; // Skip very small audio data
+  }
+  
+  // Create temporary audio file
   const tempDir = '/tmp';
   const audioFile = path.join(tempDir, `stt_openai_${session.id}_${Date.now()}.webm`);
   
   try {
     fs.writeFileSync(audioFile, audioData);
+    console.log(`🎵 Processing combined audio: ${audioData.length} bytes from ${session.audioChunks.length} chunks, language: ${session.language}`);
     
     // Create readable stream for OpenAI
     const audioStream = fs.createReadStream(audioFile);
@@ -335,6 +381,58 @@ const processWithOpenAIWhisper = async (session: STTSession): Promise<string> =>
       response_format: 'json'
     });
     
+    console.log(`📝 OpenAI transcript: "${response.text}"`);
+    return response.text || '';
+    
+  } finally {
+    // Clean up temp file
+    if (fs.existsSync(audioFile)) {
+      fs.unlinkSync(audioFile);
+    }
+  }
+};
+
+const processAllChunksWithOpenAI = async (session: STTSession): Promise<string> => {
+  if (!session.settings?.api_key) {
+    throw new Error('OpenAI API key not configured');
+  }
+  
+  const openai = new OpenAI({
+    apiKey: session.settings.api_key
+  });
+  
+  if (session.audioChunks.length === 0) {
+    return '';
+  }
+  
+  // Use the complete audio data (should be a single complete WebM file now)
+  const audioData = session.audioChunks.length === 1 ? 
+    session.audioChunks[0] : 
+    Buffer.concat(session.audioChunks);
+  
+  if (audioData.length < 1000) {
+    return ''; // Skip very small audio data
+  }
+  
+  // Create temporary audio file
+  const tempDir = '/tmp';
+  const audioFile = path.join(tempDir, `stt_final_${session.id}_${Date.now()}.webm`);
+  
+  try {
+    fs.writeFileSync(audioFile, audioData);
+    console.log(`🎵 Processing final audio: ${audioData.length} bytes, language: ${session.language}`);
+    
+    // Create readable stream for OpenAI
+    const audioStream = fs.createReadStream(audioFile);
+    
+    const response = await openai.audio.transcriptions.create({
+      file: audioStream,
+      model: 'whisper-1',
+      language: session.language,
+      response_format: 'json'
+    });
+    
+    console.log(`📝 Final OpenAI transcript: "${response.text}"`);
     return response.text || '';
     
   } finally {

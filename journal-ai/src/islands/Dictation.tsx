@@ -379,28 +379,11 @@ export default function Dictation({ sttEngine, sttLanguage }: DictationProps) {
       mediaRecorderRef.current = mediaRecorder;
       audioChunksRef.current = [];
 
-      // Handle audio data
+      // Handle audio data - collect chunks but don't send individually
       mediaRecorder.ondataavailable = async (event) => {
         if (event.data.size > 0) {
           audioChunksRef.current.push(event.data);
-          
-          // Send audio chunk to server
-          try {
-            const arrayBuffer = await event.data.arrayBuffer();
-            const audioData = Array.from(new Uint8Array(arrayBuffer));
-            
-            await fetch('/api/stt-stream', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                action: 'audio',
-                sessionId,
-                audioData
-              })
-            });
-          } catch (error) {
-            console.error('❌ Failed to send audio chunk:', error);
-          }
+          console.log(`📦 Collected audio chunk: ${event.data.size} bytes (total: ${audioChunksRef.current.length} chunks)`);
         }
       };
 
@@ -441,20 +424,31 @@ export default function Dictation({ sttEngine, sttLanguage }: DictationProps) {
     }
     
     // End STT session and get final transcript
-    if (sessionIdRef.current) {
+    if (sessionIdRef.current && audioChunksRef.current.length > 0) {
       try {
+        // Send final complete audio for processing
+        const completeBlob = new Blob(audioChunksRef.current, { type: 'audio/webm;codecs=opus' });
+        const arrayBuffer = await completeBlob.arrayBuffer();
+        const audioData = Array.from(new Uint8Array(arrayBuffer));
+        
+        console.log(`🎵 Sending final audio: ${completeBlob.size} bytes from ${audioChunksRef.current.length} chunks`);
+        
         const endResponse = await fetch('/api/stt-stream', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             action: 'end',
-            sessionId: sessionIdRef.current
+            sessionId: sessionIdRef.current,
+            audioData: audioData
           })
         });
         
         if (endResponse.ok) {
           const result = await endResponse.json();
           if (result.finalTranscript) {
+            console.log('📝 Adding final transcript:', result.finalTranscript);
+            // Clear interim and add final transcript
+            setInterim('');
             setTranscript(prev => prev + result.finalTranscript + ' ');
             insertAtCursor(result.finalTranscript + ' ');
           }
@@ -472,16 +466,27 @@ export default function Dictation({ sttEngine, sttLanguage }: DictationProps) {
   };
 
   const startPeriodicProcessing = () => {
-    // Process audio every 2 seconds for real-time transcription
+    let lastProcessedChunkCount = 0;
+    let lastTranscript = '';
+    
+    // Process audio every 3 seconds for real-time transcription
     processingIntervalRef.current = setInterval(async () => {
-      if (sessionIdRef.current) {
+      if (sessionIdRef.current && audioChunksRef.current.length > lastProcessedChunkCount) {
         try {
+          // Create a complete WebM blob from all chunks
+          const completeBlob = new Blob(audioChunksRef.current, { type: 'audio/webm;codecs=opus' });
+          const arrayBuffer = await completeBlob.arrayBuffer();
+          const audioData = Array.from(new Uint8Array(arrayBuffer));
+          
+          console.log(`🎵 Sending complete audio: ${completeBlob.size} bytes from ${audioChunksRef.current.length} chunks (last processed: ${lastProcessedChunkCount})`);
+          
           const processResponse = await fetch('/api/stt-stream', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               action: 'process',
-              sessionId: sessionIdRef.current
+              sessionId: sessionIdRef.current,
+              audioData: audioData
             })
           });
           
@@ -490,23 +495,27 @@ export default function Dictation({ sttEngine, sttLanguage }: DictationProps) {
             if (result.transcript && result.transcript.trim()) {
               console.log('📝 Received transcript:', result.transcript);
               
-              if (result.is_final) {
-                setTranscript(prev => prev + result.transcript + ' ');
-                insertAtCursor(result.transcript + ' ');
-                setInterim('');
-              } else {
-                setInterim(result.transcript);
-              }
+              // Simply replace the interim content with the latest transcript
+              setInterim(result.transcript);
+              
+              console.log('📝 Updated transcript:', result.transcript);
               
               // Reset silence timeout on new transcript
               startSilenceTimeout();
+              
+              // Update tracking variables
+              lastTranscript = result.transcript;
+              lastProcessedChunkCount = audioChunksRef.current.length;
+              
+              // Don't trim chunks as it breaks WebM structure
+              // Instead, we'll rely on the text extraction logic to avoid duplication
             }
           }
         } catch (error) {
           console.error('❌ Failed to process audio:', error);
         }
       }
-    }, 2000); // Process every 2 seconds
+    }, 4000); // Process every 4 seconds
   };
 
   const generateSessionId = (): string => {
