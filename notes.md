@@ -1,6 +1,12 @@
 
+It looks like the sessions do not have any structure, but the website does. 
+Find out if the structure is needed or not. If yes, should it be discreet AI suggestions or rather a form to fill?
+
+TODO: Think about it
 
 
+
+# Ideas
 - Chat supervisor saves each chat and gives a feedback based on the guidelines I provide in a markdown file
 - AI Critic makes requirements stricter when the AI Coach learns. The AI Coach is aware of the assessment and knows the feedback, so it knows what needs to improve.
 
